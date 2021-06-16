@@ -6,7 +6,7 @@ Sample application to auto mount embedded fs with fuse
 Requires go 1.16 >
 
 ```bash
-  go get -u github.com/moisespsena-go/sample-embedded-fuse
+  GO111MODULE=off go get -u github.com/moisespsena-go/sample-embedded-fuse
   cd $GOPATH/src/github.com/moisespsena-go/sample-embedded-fuse
  ```
  
