@@ -20,3 +20,5 @@ Requires go 1.16 >
   # or use `go build -o ./NAME` and exec `./NAME`
   go run main.go ./mnt
 ```
+
+Show mounted files in another terminal: `ls ./mnt`
