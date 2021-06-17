@@ -48,9 +48,9 @@ start_child()
 var children []*exec.Cmd
 
 type StartChildRequest struct {
-	Out, Err uintptr
-	Script   string
-	Command  []string
+	Out, Err    uintptr
+	Dir, Script string
+	Command     []string
 }
 
 type StartChildResponse struct {
@@ -66,6 +66,10 @@ func initChildClient(port string, script bool, argv ...string) {
 		buf      bytes.Buffer
 		err      error
 	)
+
+	if req.Dir, err = os.Getwd(); err != nil {
+		log.Fatalf("Read work directory fail: %v\n", err)
+	}
 
 	if script {
 		if _, err = io.Copy(&buf, os.Stdin); err != nil {
@@ -100,7 +104,7 @@ func initChildClient(port string, script bool, argv ...string) {
 		log.Fatalln("Decode response failed:", err)
 	}
 
-	os.Stdout.WriteString(strconv.Itoa(resp.Pid)+"\n")
+	os.Stdout.WriteString(strconv.Itoa(resp.Pid) + "\n")
 	if resp.Error != "" {
 		os.Stderr.WriteString(resp.Error)
 		os.Stderr.WriteString("\n")
@@ -133,11 +137,13 @@ func startChild(conn net.Conn) {
 	} else {
 		opt.Script = req.Script
 	}
-	
+
 	opt.Out = req.Out
 	opt.Err = req.Err
+	opt.Dir = req.Dir
 
 	child := opt.Create()
+
 	if err = cmds.Start(child); err != nil {
 		resp.Error = err.Error()
 		resp.ExitCode = 1

@@ -16,7 +16,7 @@ type Commands struct {
 	wg    sync.WaitGroup
 	onAdd func(cmd *Cmd)
 	Count uint64
-	mu sync.Mutex
+	mu    sync.Mutex
 }
 
 func (this *Commands) Start(cmd *Cmd) (err error) {
@@ -52,7 +52,7 @@ func (this *Commands) Start(cmd *Cmd) (err error) {
 }
 
 type CmdOpt struct {
-	Name         string
+	Name, Dir    string
 	Args         []string
 	Err, Out, In uintptr
 	Script       string
@@ -61,8 +61,8 @@ type CmdOpt struct {
 type Cmd struct {
 	*exec.Cmd
 	Closers []io.Closer
-	Error error
-	Done bool
+	Error   error
+	Done    bool
 }
 
 func (this *CmdOpt) Create() (cmd *Cmd) {
@@ -75,6 +75,7 @@ func (this *CmdOpt) Create() (cmd *Cmd) {
 	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Dir = this.Dir
 
 	if this.Err > 0 && this.Err != os.Stderr.Fd() {
 		cmd.Stderr = os.NewFile(this.Err, "stderr")

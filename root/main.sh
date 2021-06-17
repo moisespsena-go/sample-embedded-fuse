@@ -38,12 +38,16 @@ pid=$(start_cmd echo CMD DONE)
 echo "=> cmd pid: $pid"
 
 # roda um script /bin/sh em background
-pid2=$(echo 'date;sleep 10;echo SCRIPT DONE' | start_script)
+
+pid2=$(echo 'echo SCRIPT PWD: $(pwd);date;sleep 10;echo SCRIPT DONE' | start_script)
 echo "=> script pid: $pid2"
 
 # inicia o servidor nodejs em background
-pid3=$(start_cmd nodejs "$service_dir/hello_server.js")
-echo "=> nodejs server pid: $pid3"
+(
+  cd "$service_dir"
+  pid3=$(start_cmd nodejs "$service_dir/hello_server.js")
+  echo "=> nodejs server pid: $pid3"
+)
 
 sleep 2
 
