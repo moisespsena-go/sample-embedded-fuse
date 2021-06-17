@@ -1,164 +1,166 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"embed"
-	"flag"
-	"fmt"
 	iofs "io/fs"
+	"io/ioutil"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
-//go:embed root/*
-var FS embed.FS
+var (
+	//go:embed root/*
+	RootFS embed.FS
+)
 
-type Root struct {
-	fs.Inode
-	FS iofs.FS
-}
-
-var _ = (fs.NodeOnAdder)((*Root)(nil))
-
-func (this *Root) OnAdd(ctx context.Context) {
-	iofs.WalkDir(this.FS, ".", func(path string, d iofs.DirEntry, err error) error {
-		if d.IsDir() {
-			return nil
-		}
-
-		dir, base := filepath.Split(path)
-
-		p := &this.Inode
-		for _, component := range strings.Split(dir, "/") {
-			if len(component) == 0 {
-				continue
-			}
-			ch := p.GetChild(component)
-			if ch == nil {
-				ch = p.NewPersistentInode(ctx, &fs.Inode{},
-					fs.StableAttr{Mode: fuse.S_IFDIR})
-				p.AddChild(component, ch, true)
-			}
-
-			p = ch
-		}
-		ch := p.NewPersistentInode(ctx, &File{path: path, root: this.FS}, fs.StableAttr{})
-		p.AddChild(base, ch, true)
-		return nil
-	})
-}
-
-// File is a file read from a zip archive.
-type File struct {
-	fs.Inode
-
-	path string
-	root iofs.FS
-
-	mode os.FileMode
-	mu   sync.Mutex
-	f    iofs.File
-	data []byte
-}
-
-// Getattr sets the minimum, which is the size. A more full-featured
-// FS would also set timestamps and permissions.
-func (this *File) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	if this.f == nil {
-		var err error
-		if this.f, err = this.root.Open(this.path); err != nil {
-			return syscall.EIO
-		}
-	}
-
-	stat, _ := this.f.Stat()
-	out.Mode = uint32(stat.Mode()) & 07777
-	out.Nlink = 1
-	out.Mtime = uint64(stat.ModTime().Unix())
-	out.Atime = out.Mtime
-	out.Ctime = out.Mtime
-	out.Size = uint64(stat.Size())
-	const bs = 512
-	out.Blksize = bs
-	out.Blocks = (out.Size + bs - 1) / bs
-	return 0
-}
-
-// Open lazily unpacks zip data
-func (this *File) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	this.mu.Lock()
-	defer this.mu.Unlock()
-	if this.f == nil {
-		var err error
-		if this.f, err = this.root.Open(this.path); err != nil {
-			return nil, 0, syscall.EIO
-		}
-	}
-
-	if this.data == nil {
-		var err error
-		if this.data, err = iofs.ReadFile(this.root, this.path); err != nil {
-			return nil, 0, syscall.EIO
-		}
-	}
-
-	// We don't return a filehandle since we don't really need
-	// one.  The file content is immutable, so hint the kernel to
-	// cache the data.
-	return nil, fuse.FOPEN_KEEP_CACHE, 0
-}
-
-// Read simply returns the data that was already unpacked in the Open call
-func (this *File) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	end := int(off) + len(dest)
-	if end > len(this.data) {
-		end = len(this.data)
-	}
-	return fuse.ReadResultData(this.data[off:end]), 0
-}
-
-var _ = (fs.NodeGetattrer)((*File)(nil))
-var _ = (fs.NodeOnAdder)((*Root)(nil))
-
-func main() {
-	debug := flag.Bool("debug", false, "print debug data")
-	flag.Parse()
-	if len(flag.Args()) < 1 {
-		log.Fatal("Usage:\n  " + filepath.Base(os.Args[0]) + " [-debug] MOUNT_POINT")
-	}
+func do(status *int, mnt string) {
+	defer os.RemoveAll(mnt)
 	opts := &fs.Options{}
-	opts.Debug = *debug
+	opts.Debug = os.Getenv("debug") == "1"
 
 	var (
-		err  error
-		root = &Root{}
+		serviceDir = filepath.Join(mnt, "service")
+		staticDir  = filepath.Join(mnt, "static")
+		err        error
+		serviceFS  = &Root{}
+		staticFS   = &Root{}
+
+		serviceServer, staticServer *fuse.Server
+		cmd                         *exec.Cmd
+		wd                          string
+
+		// Go signal notification works by sending `os.Signal`
+		// values on a channel. We'll create a channel to
+		// receive these notifications (we'll also make one to
+		// notify us when the program can exit).
+		done     = make(chan int, 1)
+		sigs     = make(chan os.Signal, 1)
+		mainData []byte
+
+		umountServicePort string
+		umountService     = func(force bool) {
+			if force {
+				umount(serviceDir, nil)
+			} else {
+				umount(serviceDir, serviceServer)
+			}
+		}
+
+		umountStaticPort string
+		umountStatic     = func(force bool) {
+			if force {
+				umount(staticDir, nil)
+			} else {
+				umount(staticDir, staticServer)
+			}
+		}
+
+		startChildPort string
+		exe            string
 	)
 
-	if root.FS, err = iofs.Sub(FS, "root"); err != nil {
-		log.Fatalf("Get subdirectory 'root' fail: %v\n", err)
+	if err = os.MkdirAll(serviceDir, 0o770); err != nil {
+		log.Fatalf("Create directory %q fail: %v\n", serviceDir, err)
 	}
-	log.Printf("Root directory mounted into %q.", flag.Arg(0))
+
+	if err = os.MkdirAll(staticDir, 0o770); err != nil {
+		log.Fatalf("Create directory %q fail: %v\n", staticDir, err)
+	}
+
+	if wd, err = os.Getwd(); err != nil {
+		log.Fatalf("Read work directory fail: %v\n", err)
+	}
+
+	if exe, err = filepath.Abs(os.Args[0]); err != nil {
+		log.Fatalf("Detect exe path fail: %v\n", err)
+	}
+
+	if mainData, err = RootFS.ReadFile("root/main.sh"); err != nil {
+		log.Fatalf("Get main.sh data fail: %v\n", err)
+	}
+	mainData = append([]byte(script), mainData...)
+
+	// ---- service FS ----
+	if serviceFS.FS, err = iofs.Sub(RootFS, "root/service"); err != nil {
+		log.Fatalf("Get subdirectory 'root/service' fail: %v\n", err)
+	}
+
+	log.Printf("Root directory mounted into %q.", mnt)
 	log.Printf("press CTRL+C or send SIGINT or SIGTERM signals to stop server.")
 
-	server, err := fs.Mount(flag.Arg(0), root, opts)
-	if err != nil {
-		log.Fatalf("Mount fail: %v\n", err)
+	if serviceServer, err = fs.Mount(serviceDir, serviceFS, opts); err != nil {
+		log.Fatalf("Mount service server fail: %v\n", err)
 	}
 
-	// Go signal notification works by sending `os.Signal`
-	// values on a channel. We'll create a channel to
-	// receive these notifications (we'll also make one to
-	// notify us when the program can exit).
-	sigs := make(chan os.Signal, 1)
-	done := make(chan bool, 1)
+	defer umountService(false)
+
+	// ---- static FS ----
+	if staticFS.FS, err = iofs.Sub(RootFS, "root/static"); err != nil {
+		log.Fatalf("Get subdirectory 'root/static' fail: %v\n", err)
+	}
+
+	if staticServer, err = fs.Mount(staticDir, staticFS, opts); err != nil {
+		log.Fatalf("Mount static server fail: %v\n", err)
+	}
+
+	defer umountStatic(false)
+
+	// ---- server to umount service fs from root/main.sh ----
+
+	umountServicePort = umountSignal(func() {
+		umountService(true)
+	})
+
+	umountStaticPort = umountSignal(func() {
+		umountStatic(true)
+	})
+
+	startChildPort = startChildServer()
+	log.Println("start child server port:", startChildPort)
+
+	cmd = exec.Command("sh", append([]string{"-s"}, os.Args[1:]...)...)
+	cmd.Stdin = bytes.NewBuffer(mainData)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	cmd.Dir = mnt
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Env = append(cmd.Env,
+		"cwd="+wd,
+		"service_dir="+serviceDir,
+		"static_dir="+staticDir,
+		"umnt_service_port="+umountServicePort,
+		"umnt_static_port="+umountStaticPort)
+
+	cmds.onAdd = func(cmd *Cmd) {
+		cmd.Env = append(cmd.Env,
+			"start_child_port="+startChildPort,
+			"exe="+exe,
+		)
+	}
+
+	if err = cmds.Start(&Cmd{Cmd: cmd}); err != nil {
+		log.Fatalf("Run `main.sh` fail: %v\n", err)
+	}
+
+	go func() {
+		defer func() {
+			if cmds.Count == 1 {
+				done <- cmd.ProcessState.ExitCode()
+			} else {
+				close(done)
+			}
+		}()
+		cmds.wg.Wait()
+	}()
 
 	// `signal.Notify` registers the given channel to
 	// receive notifications of the specified signals.
@@ -169,20 +171,43 @@ func main() {
 	// and then notify the program that it can finish.
 	go func() {
 		sig := <-sigs
-		fmt.Println()
-		fmt.Println(sig)
-		done <- true
+		log.Println()
+		log.Println("received signal:", sig)
+		for _, cmd := range cmds.cmds {
+			if !cmd.Done {
+				cmd.Process.Signal(sig)
+			}
+		}
 	}()
 
 	// The program will wait here until it gets the
 	// expected signal (as indicated by the goroutine
 	// above sending a value on `done`) and then exit.
-	fmt.Println("awaiting signal")
-	<-done
-	fmt.Println("exiting")
-	if err = server.Unmount(); err != nil {
-		fmt.Println("umount failed:", err)
-	} else {
-		fmt.Println("umounted")
+	log.Println("awaiting signal")
+	*status = <-done
+}
+
+func main() {
+	if len(os.Args) > 2 {
+		switch os.Args[1] {
+		case "!cmd":
+			initChildClient(os.Args[2], false, os.Args[3:]...)
+		case "!script":
+			initChildClient(os.Args[2], true, os.Args[3:]...)
+		}
+		return
 	}
+
+	var (
+		mnt, err = ioutil.TempDir("", filepath.Base(os.Args[0]))
+		status   int
+	)
+
+	if err != nil {
+		log.Fatalf("Create temp dir fail: %v\n", err)
+	}
+
+	do(&status, mnt)
+	log.Printf("Exit status: %d.", status)
+	os.Exit(status)
 }

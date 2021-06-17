@@ -12,11 +12,18 @@ Requires go 1.16 >
  
 ## Usage
 
- ```bash
-  echo hello > root/hello.txt
-  
-  # create mount point directory
-  mkdir mnt
-  # or use `go build -o ./NAME` and exec `./NAME`
-  go run main.go ./mnt
+- Master application script: `root/main.sh`. 
+- Put your service source code into `root/service/`.
+- Put your static or assets int `root/static/`.
+
+Run:
+ ```bash  
+  go run .
+```
+
+or
+
+```bash  
+  go build . -o my_app
+  ./my_app
 ```
