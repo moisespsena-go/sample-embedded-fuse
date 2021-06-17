@@ -27,3 +27,5 @@ or
   go build . -o my_app
   ./my_app
 ```
+
+Show mounted files in another terminal: `ls ./mnt`
